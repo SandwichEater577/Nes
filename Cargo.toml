@@ -1,0 +1,13 @@
+[package]
+name = "nes"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3          # Maximum optimization
+lto = true             # Link-Time Optimization — whole-program inlining
+codegen-units = 1      # Single codegen unit — allows best optimization
+panic = "abort"        # No unwinding overhead — smaller & faster binary
+strip = true           # Strip debug symbols — smallest possible exe
