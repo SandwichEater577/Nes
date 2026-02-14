@@ -1,0 +1,16 @@
+echo === Hello from Nes! ===
+let name = World
+echo Greetings, $name
+echo
+echo Today is:
+date
+echo
+echo Current time:
+time
+echo
+echo You are:
+whoami
+echo on:
+hostname
+echo running:
+os

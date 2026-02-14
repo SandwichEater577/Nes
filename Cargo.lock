@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "nestea"
+name = "nes"
 version = "1.0.0"

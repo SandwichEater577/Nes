@@ -1,0 +1,29 @@
+echo === Project Scaffolder ===
+let name = myproject
+echo Creating project: $name
+
+mkdir $name
+cd $name
+mkdir src
+mkdir tests
+mkdir docs
+
+echo # $name > README.md
+echo >> README.md
+echo A new project. >> README.md
+
+touch src/main.rs
+touch tests/test.rs
+
+echo fn main() { > src/main.rs
+echo     println!("Hello from $name!"); >> src/main.rs
+echo } >> src/main.rs
+
+echo Project $name created!
+echo
+echo Structure:
+tree .
+echo
+echo Files:
+wc src/main.rs
+wc README.md

@@ -1,0 +1,48 @@
+echo === File Operations Demo ===
+echo
+
+echo Creating workspace...
+mkdir demo_workspace
+cd demo_workspace
+
+echo Writing files...
+echo Hello World > hello.txt
+echo Line 1 > multi.txt
+echo Line 2 >> multi.txt
+echo Line 3 >> multi.txt
+echo Line 4 >> multi.txt
+echo Line 5 >> multi.txt
+
+echo
+echo --- cat ---
+cat hello.txt
+
+echo
+echo --- head 3 ---
+head 3 multi.txt
+
+echo
+echo --- tail 2 ---
+tail 2 multi.txt
+
+echo
+echo --- wc ---
+wc multi.txt
+
+echo
+echo --- grep ---
+grep Line multi.txt
+
+echo
+echo --- ls ---
+ls
+
+echo
+echo --- size ---
+size .
+
+echo
+echo Cleaning up...
+cd ..
+rm demo_workspace
+echo Done!

@@ -1,0 +1,22 @@
+echo === System Information ===
+echo
+echo User:      
+whoami
+echo Hostname:  
+hostname
+echo OS:        
+os
+echo Time:      
+time
+echo
+echo === Directory Contents ===
+ls
+echo
+echo === Directory Tree ===
+tree .
+echo
+echo === Disk Usage ===
+size .
+echo
+echo === Environment Variables ===
+env

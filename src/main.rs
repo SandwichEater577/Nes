@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufWriter, Write};
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 struct Shell {
     vars: HashMap<String, String>,
@@ -28,7 +30,149 @@ impl Shell {
         let _ = out.flush();
     }
 
+    fn block_prompt(out: &mut impl Write) {
+        let _ = write!(out, "\x1b[33m ...>\x1b[0m ");
+        let _ = out.flush();
+    }
+
+    // ── Block execution (if/for/comments) ─────────────────────────
+
+    fn exec_lines(&mut self, lines: &[String], out: &mut BufWriter<io::StdoutLock<'_>>) {
+        let mut pc = 0;
+        while pc < lines.len() && self.running {
+            let raw = lines[pc].trim();
+            if raw.is_empty() || raw.starts_with('#') { pc += 1; continue; }
+
+            if raw.starts_with("if ") {
+                let (else_idx, end_idx) = Self::find_block_end(lines, pc);
+                if end_idx >= lines.len() {
+                    let _ = write!(out, "\x1b[31mnes: missing 'end' for 'if'\x1b[0m\n");
+                    return;
+                }
+                let cond = self.expand_vars(&raw[3..]);
+                if self.eval_condition(&cond) {
+                    let stop = else_idx.unwrap_or(end_idx);
+                    let body: Vec<String> = lines[pc + 1..stop].to_vec();
+                    self.exec_lines(&body, out);
+                } else if let Some(ei) = else_idx {
+                    let body: Vec<String> = lines[ei + 1..end_idx].to_vec();
+                    self.exec_lines(&body, out);
+                }
+                pc = end_idx + 1;
+            } else if raw.starts_with("for ") {
+                let (_, end_idx) = Self::find_block_end(lines, pc);
+                if end_idx >= lines.len() {
+                    let _ = write!(out, "\x1b[31mnes: missing 'end' for 'for'\x1b[0m\n");
+                    return;
+                }
+                let body: Vec<String> = lines[pc + 1..end_idx].to_vec();
+                let header = self.expand_vars(raw);
+                self.exec_for(&header, &body, out);
+                pc = end_idx + 1;
+            } else {
+                self.exec(raw, out);
+                pc += 1;
+            }
+        }
+    }
+
+    fn find_block_end(lines: &[String], start: usize) -> (Option<usize>, usize) {
+        let mut depth = 0u32;
+        let mut else_pos = None;
+        for i in (start + 1)..lines.len() {
+            let l = lines[i].trim();
+            if l.starts_with("if ") || l.starts_with("for ") { depth += 1; }
+            else if l == "end" {
+                if depth == 0 { return (else_pos, i); }
+                depth -= 1;
+            } else if l == "else" && depth == 0 {
+                else_pos = Some(i);
+            }
+        }
+        (None, lines.len()) // no matching end
+    }
+
+    fn eval_condition(&self, cond: &str) -> bool {
+        let cond = cond.trim();
+        if let Some(rest) = cond.strip_prefix("exists ") {
+            return Path::new(rest.trim()).exists();
+        }
+        if let Some(rest) = cond.strip_prefix("not ") {
+            return !self.eval_condition(rest);
+        }
+        if let Some(pos) = cond.find(" >= ") {
+            let l: f64 = cond[..pos].trim().parse().unwrap_or(f64::NAN);
+            let r: f64 = cond[pos + 4..].trim().parse().unwrap_or(f64::NAN);
+            return l >= r;
+        }
+        if let Some(pos) = cond.find(" <= ") {
+            let l: f64 = cond[..pos].trim().parse().unwrap_or(f64::NAN);
+            let r: f64 = cond[pos + 4..].trim().parse().unwrap_or(f64::NAN);
+            return l <= r;
+        }
+        if let Some(pos) = cond.find(" == ") {
+            return cond[..pos].trim() == cond[pos + 4..].trim();
+        }
+        if let Some(pos) = cond.find(" != ") {
+            return cond[..pos].trim() != cond[pos + 4..].trim();
+        }
+        if let Some(pos) = cond.find(" > ") {
+            let l: f64 = cond[..pos].trim().parse().unwrap_or(f64::NAN);
+            let r: f64 = cond[pos + 3..].trim().parse().unwrap_or(f64::NAN);
+            return l > r;
+        }
+        if let Some(pos) = cond.find(" < ") {
+            let l: f64 = cond[..pos].trim().parse().unwrap_or(f64::NAN);
+            let r: f64 = cond[pos + 3..].trim().parse().unwrap_or(f64::NAN);
+            return l < r;
+        }
+        !cond.is_empty() && cond != "false" && cond != "0"
+    }
+
+    fn exec_for(&mut self, header: &str, body: &[String], out: &mut BufWriter<io::StdoutLock<'_>>) {
+        let after = header[4..].trim();
+        let (var, rest) = match after.find(" in ") {
+            Some(p) => (after[..p].trim(), after[p + 4..].trim()),
+            None => return,
+        };
+        let var = var.to_string();
+        let items: Vec<String> = if rest == "files" || rest.starts_with("files ") {
+            let dir = if rest == "files" { "." } else { rest[5..].trim() };
+            let dir = if dir.is_empty() { "." } else { dir };
+            let mut v: Vec<String> = fs::read_dir(dir).ok()
+                .map(|e| e.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
+            v.sort_unstable();
+            v
+        } else if rest.starts_with("range ") {
+            let p: Vec<&str> = rest[6..].split_whitespace().collect();
+            if p.len() >= 2 {
+                let s: i64 = p[0].parse().unwrap_or(0);
+                let e: i64 = p[1].parse().unwrap_or(0);
+                if s <= e { (s..=e).map(|n| n.to_string()).collect() }
+                else { (e..=s).rev().map(|n| n.to_string()).collect() }
+            } else { Vec::new() }
+        } else if rest.starts_with("lines ") {
+            let file = rest[6..].trim();
+            fs::read_to_string(file).ok()
+                .map(|c| c.lines().map(String::from).collect())
+                .unwrap_or_default()
+        } else {
+            Self::split_args(rest)
+        };
+        for item in items {
+            if !self.running { break; }
+            self.vars.insert(var.clone(), item);
+            self.exec_lines(body, out);
+        }
+    }
+
+    // ── Single-line execution (&&, |, >, >>) ─────────────────────
+
     fn exec(&mut self, raw: &str, out: &mut BufWriter<io::StdoutLock<'_>>) {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.starts_with('#') { return; }
+        if raw == "end" || raw == "else" { return; }
         let raw = self.expand_vars(raw);
         for chain in raw.split("&&") {
             let chain = chain.trim();
@@ -56,7 +200,7 @@ impl Shell {
         let chars: Vec<char> = input.chars().collect();
         let mut i = 0;
         while i < chars.len() {
-            if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1].is_alphanumeric() {
+            if chars[i] == '$' && i + 1 < chars.len() && (chars[i + 1].is_alphanumeric() || chars[i + 1] == '_') {
                 i += 1;
                 let start = i;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') { i += 1; }
@@ -116,6 +260,8 @@ impl Shell {
         for mut c in children { let _ = c.wait(); }
     }
 
+    // ── Command dispatch ──────────────────────────────────────────
+
     fn dispatch(&mut self, input: &str, out: &mut BufWriter<io::StdoutLock<'_>>) {
         let parts = Self::split_args(input);
         if parts.is_empty() { return; }
@@ -153,6 +299,33 @@ impl Shell {
                 }
             }
             "echo" => { let _ = write!(out, "{}\n", arg_str); }
+            "read" => {
+                if arg_str.is_empty() { let _ = out.write_all(b"Usage: read <varname>\n"); return; }
+                let _ = out.flush();
+                let mut input = String::new();
+                let _ = io::stdin().read_line(&mut input);
+                self.vars.insert(arg_str.clone(), input.trim().to_string());
+            }
+            "sleep" => {
+                let ms: u64 = arg_str.trim().parse().unwrap_or(0);
+                if ms > 0 { thread::sleep(Duration::from_millis(ms)); }
+            }
+            "exists" => {
+                if arg_str.is_empty() { let _ = out.write_all(b"Usage: exists <path>\n"); return; }
+                let _ = write!(out, "{}\n", Path::new(arg_str.as_str()).exists());
+            }
+            "count" => {
+                let dir = if arg_str.is_empty() { ".".into() } else { arg_str };
+                let n = fs::read_dir(&dir).ok().map(|e| e.count()).unwrap_or(0);
+                let _ = write!(out, "{}\n", n);
+            }
+            "typeof" => {
+                if arg_str.is_empty() { let _ = out.write_all(b"Usage: typeof <path>\n"); return; }
+                let p = Path::new(arg_str.as_str());
+                if p.is_file() { let _ = out.write_all(b"file\n"); }
+                else if p.is_dir() { let _ = out.write_all(b"dir\n"); }
+                else { let _ = out.write_all(b"none\n"); }
+            }
             "set" => {
                 if arg_str.is_empty() {
                     for (k, v) in &self.vars {
@@ -256,7 +429,7 @@ impl Shell {
             "touch" => { let _ = fs::OpenOptions::new().create(true).append(true).open(&arg_str); }
             "mkdir" => { let _ = fs::create_dir_all(&arg_str); }
             "rm" => {
-                let path = std::path::Path::new(arg_str.as_str());
+                let path = Path::new(arg_str.as_str());
                 if path.is_dir() { let _ = fs::remove_dir_all(path); }
                 else { let _ = fs::remove_file(path); }
             }
@@ -282,11 +455,11 @@ impl Shell {
             }
             "find" => {
                 let pattern = if arg_str.is_empty() { "*" } else { &arg_str };
-                Self::find_recursive(std::path::Path::new("."), pattern, out);
+                Self::find_recursive(Path::new("."), pattern, out);
             }
             "tree" => {
                 let dir = if arg_str.is_empty() { "." } else { &arg_str };
-                Self::print_tree(std::path::Path::new(dir), "", true, out);
+                Self::print_tree(Path::new(dir), "", true, out);
             }
             "whoami" => {
                 let u = env::var("USERNAME").or_else(|_| env::var("USER")).unwrap_or("unknown".into());
@@ -330,12 +503,8 @@ impl Shell {
             "run" => {
                 if arg_str.is_empty() { let _ = out.write_all(b"Usage: run <script.nes>\n"); return; }
                 if let Ok(script) = fs::read_to_string(&arg_str) {
-                    for line in script.lines() {
-                        let line = line.trim();
-                        if line.is_empty() { continue; }
-                        self.exec(line, out);
-                        if !self.running { break; }
-                    }
+                    let lines: Vec<String> = script.lines().map(String::from).collect();
+                    self.exec_lines(&lines, out);
                 } else {
                     let _ = write!(out, "run: cannot read '{}'\n", arg_str);
                 }
@@ -343,7 +512,7 @@ impl Shell {
             "which" => {
                 if let Ok(path) = env::var("PATH") {
                     for dir in path.split(';') {
-                        let p = std::path::Path::new(dir).join(format!("{}.exe", arg_str));
+                        let p = Path::new(dir).join(format!("{}.exe", arg_str));
                         if p.exists() { let _ = write!(out, "{}\n", p.display()); return; }
                     }
                 }
@@ -364,7 +533,7 @@ impl Shell {
             }
             "size" => {
                 if arg_str.is_empty() { let _ = out.write_all(b"Usage: size <path>\n"); return; }
-                let path = std::path::Path::new(arg_str.as_str());
+                let path = Path::new(arg_str.as_str());
                 let total = Self::dir_size(path);
                 let _ = write!(out, "{}\n", Self::human_size(total));
             }
@@ -412,6 +581,8 @@ impl Shell {
         }
     }
 
+    // ── Helpers ───────────────────────────────────────────────────
+
     fn split_args(input: &str) -> Vec<String> {
         let mut args = Vec::new();
         let mut current = String::new();
@@ -445,7 +616,7 @@ impl Shell {
         }
     }
 
-    fn find_recursive(dir: &std::path::Path, pattern: &str, out: &mut impl Write) {
+    fn find_recursive(dir: &Path, pattern: &str, out: &mut impl Write) {
         if let Ok(entries) = fs::read_dir(dir) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -458,7 +629,7 @@ impl Shell {
         }
     }
 
-    fn print_tree(dir: &std::path::Path, prefix: &str, is_last: bool, out: &mut impl Write) {
+    fn print_tree(dir: &Path, prefix: &str, is_last: bool, out: &mut impl Write) {
         let name = dir.file_name().map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.to_string_lossy().into_owned());
         let connector = if prefix.is_empty() { "" } else if is_last { "└── " } else { "├── " };
@@ -479,7 +650,7 @@ impl Shell {
         }
     }
 
-    fn dir_size(path: &std::path::Path) -> u64 {
+    fn dir_size(path: &Path) -> u64 {
         if path.is_file() {
             return path.metadata().map(|m| m.len()).unwrap_or(0);
         }
@@ -500,12 +671,13 @@ impl Shell {
     }
 
     fn write_help(&self, out: &mut impl Write) {
-        let _ = out.write_all(b"\x1b[33mnes\x1b[0m \xE2\x80\x94 the nestea shell\n\n\
+        let _ = out.write_all(b"\x1b[33mnes\x1b[0m \xE2\x80\x94 the nestea shell v4.0\n\n\
 \x1b[36mNavigation\x1b[0m    cd ls ll pwd tree find which\n\
 \x1b[36mFiles\x1b[0m         cat head tail wc touch mkdir rm cp mv hex size\n\
 \x1b[36mText\x1b[0m          echo grep\n\
 \x1b[36mSystem\x1b[0m        whoami hostname os env time date open clear\n\
-\x1b[36mShell\x1b[0m         let set unset export alias history run\n\
+\x1b[36mShell\x1b[0m         let set unset export alias history run read\n\
+\x1b[36mControl\x1b[0m       if/else/end  for/end  sleep  exists  count  typeof\n\
 \x1b[36mMath\x1b[0m          calc <expr>\n\
 \x1b[36mFlow\x1b[0m          cmd1 && cmd2    cmd > file    cmd >> file    cmd | cmd\n\
 \x1b[36mOther\x1b[0m         Any unknown command runs as a system command\n\
@@ -517,7 +689,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         let mut out = BufWriter::with_capacity(4096, io::stdout().lock());
-        let _ = out.write_all(b"\x1b[33mnes\x1b[0m \xE2\x80\x94 the nestea shell v3.0\n\
+        let _ = out.write_all(b"\x1b[33mnes\x1b[0m \xE2\x80\x94 the nestea shell v4.0\n\
   nes <command>       run a single command\n\
   nes enter-full      launch interactive shell\n\
   nes run <file.nes>  run a script\n\
@@ -530,30 +702,54 @@ fn main() {
     if first == "--completions" {
         print!("cd\nls\nll\npwd\ntree\nfind\nwhich\ncat\nhead\ntail\nwc\ntouch\nmkdir\nrm\ncp\nmv\nhex\nsize\n\
 echo\ngrep\nwhoami\nhostname\nos\nenv\ntime\ndate\nopen\nclear\ncls\n\
-let\nset\nunset\nexport\nalias\nhistory\nrun\ncalc\nhelp\nenter-full\nexit\nquit\n");
+let\nset\nunset\nexport\nalias\nhistory\nrun\nread\nsleep\nexists\ncount\ntypeof\n\
+if\nfor\nend\nelse\ncalc\nhelp\nenter-full\nexit\nquit\n");
         return;
     }
     let mut shell = Shell::new();
     if first == "enter-full" {
-        let mut out = BufWriter::with_capacity(4096, io::stdout().lock());
-        let _ = out.write_all(b"\x1b[33mnes\x1b[0m \xE2\x80\x94 the nestea shell v3.0\n\n");
-        let _ = out.flush();
+        {
+            let mut out = BufWriter::with_capacity(4096, io::stdout().lock());
+            let _ = out.write_all(b"\x1b[33mnes\x1b[0m \xE2\x80\x94 the nestea shell v4.0\n\n");
+            let _ = out.flush();
+        }
         let stdin = io::stdin();
-        let mut reader = stdin.lock();
         let mut buf = String::with_capacity(256);
+        let mut block_buf: Vec<String> = Vec::new();
+        let mut block_depth: i32 = 0;
         loop {
             {
                 let mut out = BufWriter::with_capacity(4096, io::stdout().lock());
-                shell.prompt(&mut out);
+                if block_depth > 0 { Shell::block_prompt(&mut out); }
+                else { shell.prompt(&mut out); }
             }
             buf.clear();
-            if reader.read_line(&mut buf).unwrap_or(0) == 0 { break; }
+            if stdin.read_line(&mut buf).unwrap_or(0) == 0 { break; }
             let input = buf.trim().to_string();
             if input.is_empty() { continue; }
             shell.history.push(input.clone());
-            let mut out = BufWriter::with_capacity(4096, io::stdout().lock());
-            shell.exec(&input, &mut out);
-            let _ = out.flush();
+
+            let trimmed = input.trim();
+            let starts_block = trimmed.starts_with("if ") || trimmed.starts_with("for ");
+            let is_end = trimmed == "end";
+
+            if block_depth > 0 || starts_block {
+                if starts_block { block_depth += 1; }
+                block_buf.push(input);
+                if is_end {
+                    block_depth -= 1;
+                    if block_depth == 0 {
+                        let mut out = BufWriter::with_capacity(4096, io::stdout().lock());
+                        shell.exec_lines(&block_buf, &mut out);
+                        let _ = out.flush();
+                        block_buf.clear();
+                    }
+                }
+            } else {
+                let mut out = BufWriter::with_capacity(4096, io::stdout().lock());
+                shell.exec(&input, &mut out);
+                let _ = out.flush();
+            }
             if !shell.running { break; }
         }
     } else {
